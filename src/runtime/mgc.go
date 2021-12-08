@@ -2159,6 +2159,11 @@ func gcMarkWorkAvailable(p *p) bool {
 // All gcWork caches must be empty.
 // STW is in effect at this point.
 //TODO go:nowritebarrier
+/*
+gcmark在每次标记结束后重置阈值大小。当前使用了4MB内存，这时设置gc_trigger为2*4MB，
+也就是当内存分配到8MB时会再次触发GC。回收之后内存为5MB，那下一次要达到10MB才会触发GC。
+这个比例triggerRatio是由gcpercent/100决定的。
+*/
 func gcMark(start_time int64) {
 	if debug.allocfreetrace > 0 {
 		tracegc()
