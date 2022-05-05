@@ -67,6 +67,7 @@ func semasleep(ns int64) int32 {
 
 //go:nosplit
 // 条件变量。获取信号
+// 在Go中，线程的挂起与唤醒是通过多线程条件变量实现的，感兴趣的同学可以自行了解。
 func semawakeup(mp *m) {
 	pthread_mutex_lock(&mp.mutex)
 	mp.count++
@@ -131,6 +132,8 @@ func goenvs() {
 
 // May run with m.p==nil, so write barriers are not allowed.
 //go:nowritebarrierrec
+// 函数newosproc在创建系统线程时首先屏蔽当前线程的信号量，然后调用clone函数克隆出新的线程，随后恢复当前线程的信号量。
+// 新克隆的线程在最开始是信号量屏蔽的，会在函数minit中进行初始化。
 func newosproc(mp *m) {
 	stk := unsafe.Pointer(mp.g0.stack.hi)
 	if false {
@@ -164,6 +167,7 @@ func newosproc(mp *m) {
 	// Finally, create the thread. It starts at mstart_stub, which does some low-level
 	// setup and then calls mstart.
 	var oset sigset
+	// 线程克隆过程中屏蔽信号量
 	sigprocmask(_SIG_SETMASK, &sigset_all, &oset)
 	err = pthread_create(&attr, funcPC(mstart_stub), unsafe.Pointer(mp))
 	sigprocmask(_SIG_SETMASK, &oset, nil)

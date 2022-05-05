@@ -14,25 +14,35 @@
 // Note that this differs from "standard" ABI convention, which
 // would pass 4th arg in CX, not R10.
 
+// 函数Syscall和Syscall6的区别只是参数个数不同，Syscall和RawSyscall的区别主要在于是否支持协程调度。
+// 我们这里只关心下Syscall的实现逻辑
 TEXT ·Syscall(SB),NOSPLIT,$0-56
+    // 系统调用前的准备工作
 	CALL	runtime·entersyscall(SB)
+	// 准备参数
 	MOVQ	a1+8(FP), DI
 	MOVQ	a2+16(FP), SI
 	MOVQ	a3+24(FP), DX
 	MOVQ	$0, R10
 	MOVQ	$0, R8
 	MOVQ	$0, R9
+	// 系统调用号
 	MOVQ	trap+0(FP), AX	// syscall entry
+	// 执行系统调用
 	SYSCALL
+	// 判断调用是否成功
 	CMPQ	AX, $0xfffffffffffff001
 	JLS	ok
+	// 调用异常
 	MOVQ	$-1, r1+32(FP)
 	MOVQ	$0, r2+40(FP)
 	NEGQ	AX
 	MOVQ	AX, err+48(FP)
+	// 系统调用收尾工作
 	CALL	runtime·exitsyscall(SB)
 	RET
 ok:
+    // 调用成功
 	MOVQ	AX, r1+32(FP)
 	MOVQ	DX, r2+40(FP)
 	MOVQ	$0, err+48(FP)

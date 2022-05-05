@@ -139,6 +139,14 @@ func chansend1(c *hchan, elem unsafe.Pointer) {
  * been closed.  it is easiest to loop and re-run
  * the operation; we'll see that it's now closed.
  */
+// Channel作为官方推荐的协程间通信方式，在整个Go语言中有举足轻重的作用，是支撑Go语言高性能并发编程模型的最重要结构。
+// 本文只简单的介绍Channel中可以触发协程调度的部分，更细节的内容可以参考：Go语言Channel实现原理精要(https://draveness.me/golang/docs/part3-runtime/ch06-concurrency/golang-channel/)
+// Channel会在数据发送和数据接受两个环节触发协程调度。为了简化实现，我们只考虑无缓冲、异步的Channel
+
+// 经过编译后，Channel最终通过chansend函数实现了数据的发送
+
+// 1. 首先检查是否已存在接收者，如果存在则将数据直接发送给接收者并将接收者协程唤醒，放入本地运行队列，当前协程继续运行
+// 2. 如果不存在接收者，则将当前协程挂起，等待接收者就绪后被唤醒
 func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 	if c == nil {
 		if !block {
@@ -187,6 +195,8 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 		panic(plainError("send on closed channel"))
 	}
 
+	// 1. 检查当前是否存在接收者，如果存在则将数据直接发给接收者
+	// 2. 唤醒接收者，当前协程继续执行
 	if sg := c.recvq.dequeue(); sg != nil {
 		// Found a waiting receiver. We pass the value we want to send
 		// directly to the receiver, bypassing the channel buffer (if any).
@@ -217,6 +227,7 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 	}
 
 	// Block on the channel. Some receiver will complete our operation for us.
+	// 创建或复用sudog
 	gp := getg()
 	mysg := acquireSudog()
 	mysg.releasetime = 0
@@ -232,7 +243,9 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 	mysg.c = c
 	gp.waiting = mysg
 	gp.param = nil
+	// 将当前g的包装结构sudug放入发送者队列中
 	c.sendq.enqueue(mysg)
+	// 当前g进行挂起，等待接收者就绪后再次唤醒调度
 	goparkunlock(&c.lock, waitReasonChanSend, traceEvGoBlockSend, 3)
 	// Ensure the value being sent is kept alive until the
 	// receiver copies it out. The sudog has a pointer to the
@@ -286,6 +299,7 @@ func send(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
 			c.sendx = c.recvx // c.sendx = (c.sendx+1) % c.dataqsiz
 		}
 	}
+	// 直接进行数据拷贝
 	if sg.elem != nil {
 		sendDirect(c.elemtype, sg, ep)
 		sg.elem = nil
@@ -296,6 +310,7 @@ func send(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
 	if sg.releasetime != 0 {
 		sg.releasetime = cputicks()
 	}
+	// 唤醒接收者协程
 	goready(gp, skip+1)
 }
 
@@ -418,6 +433,12 @@ func chanrecv2(c *hchan, elem unsafe.Pointer) (received bool) {
 // Otherwise, if c is closed, zeros *ep and returns (true, false).
 // Otherwise, fills in *ep with an element and returns (true, true).
 // A non-nil ep must point to the heap or the caller's stack.
+// 经过编译后，Channel最终通过chanrecv函数实现数据的接收：
+// 1. 首先检查是否存在数据发送者，如果存在，则直接将发送者的数据拷贝，并唤醒发送者协程
+// 2. 如果不存在等待的发送者，那么将当前协程挂起，等待发送者将其唤醒
+// 在无缓冲的简单Channel使用场景中，goready和gopark分别实现了协程的唤醒以及挂起。
+// 对于数据发送者而言，如果存在等待中的数据接收者，则将数据直接拷贝给接收者并通过goready将其唤醒。
+// 如果不存在接收者，则通过gopark将自己挂起，等待数据发送者将自己唤醒。数据接收者亦然。
 func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool) {
 	// raceenabled: don't need to check ep, as it is always on the stack
 	// or is new memory allocated by reflect.
@@ -470,6 +491,7 @@ func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool)
 		return true, false
 	}
 
+	// 如果存在发送者，则将发送者的数据接收，然后唤醒发送者协程，当前协程继续运行
 	if sg := c.sendq.dequeue(); sg != nil {
 		// Found a waiting sender. If buffer is size 0, receive value
 		// directly from sender. Otherwise, receive from head of queue
@@ -505,7 +527,9 @@ func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool)
 	}
 
 	// no sender available: block on this channel.
+	// 如果不存在发送者，则将当前协程挂起，等待发送者唤起
 	gp := getg()
+	// 构建sudog
 	mysg := acquireSudog()
 	mysg.releasetime = 0
 	if t0 != 0 {
@@ -520,7 +544,9 @@ func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool)
 	mysg.isSelect = false
 	mysg.c = c
 	gp.param = nil
+	// 加入接收者队列
 	c.recvq.enqueue(mysg)
+	// 将当前协程挂起
 	goparkunlock(&c.lock, waitReasonChanReceive, traceEvGoBlockRecv, 3)
 
 	// someone woke us up
@@ -551,6 +577,7 @@ func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool)
 // Channel c must be full and locked. recv unlocks c with unlockf.
 // sg must already be dequeued from c.
 // A non-nil ep must point to the heap or the caller's stack.
+// 接收发送者的数据并唤醒发送者
 func recv(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
 	if c.dataqsiz == 0 {
 		if raceenabled {
@@ -558,6 +585,7 @@ func recv(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
 		}
 		if ep != nil {
 			// copy data from sender
+			// 直接拷贝发送者的数据
 			recvDirect(c.elemtype, sg, ep)
 		}
 	} else {
@@ -591,6 +619,7 @@ func recv(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
 	if sg.releasetime != 0 {
 		sg.releasetime = cputicks()
 	}
+	// 唤醒数据发送者，协程gp状态更新为可运行(_Grunnable),并加入p的本地可运行g队列中
 	goready(gp, skip+1)
 }
 

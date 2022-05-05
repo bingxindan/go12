@@ -125,6 +125,7 @@ func noteclear(n *note) {
 	n.key = 0
 }
 
+// 在Go中，线程的挂起与唤醒是通过多线程条件变量实现的，感兴趣的同学可以自行了解。
 func notewakeup(n *note) {
 	var v uintptr
 	for {

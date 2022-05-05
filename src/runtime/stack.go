@@ -910,7 +910,13 @@ func round2(x int32) int32 {
 // compiler doesn't check this.
 //
 //go:nowritebarrierrec
+// 函数morestack首先保存了当前的现场，然后转到g0栈上调用函数newstack实现扩栈&抢占。
+
+// 函数newstack中抢占部分相对比较简单，首先是进行各项条件检查，如果满足抢占条件，则主动让出处理器资源，
+// 将当前g放入全局队列，然后再次开始新的调度循环。从各项检查条件来看，抢占是一个相对保守的操作，
+// 应该优先保障运行，不应该轻易发生抢占。
 func newstack() {
+	// 获取g(m.g0)
 	thisg := getg()
 	// TODO: double check all gp. shouldn't be getg().
 	if thisg.m.morebuf.g.ptr().stackguard0 == stackFork {
@@ -923,6 +929,7 @@ func newstack() {
 		throw("runtime: wrong goroutine in newstack")
 	}
 
+	// 当前m正在运行的g
 	gp := thisg.m.curg
 
 	if thisg.m.curg.throwsplit {
@@ -946,6 +953,7 @@ func newstack() {
 		throw("runtime: stack split at bad time")
 	}
 
+	// 保存m.morebuf的临时值，并将m.morebuf清空
 	morebuf := thisg.m.morebuf
 	thisg.m.morebuf.pc = 0
 	thisg.m.morebuf.lr = 0
@@ -955,6 +963,7 @@ func newstack() {
 	// NOTE: stackguard0 may change underfoot, if another thread
 	// is about to try to preempt gp. Read it just once and use that same
 	// value now and below.
+	// 检测是否应该发生抢占
 	preempt := atomic.Loaduintptr(&gp.stackguard0) == stackPreempt
 
 	// Be conservative about where we preempt.
@@ -969,10 +978,17 @@ func newstack() {
 	// If the GC is in some way dependent on this goroutine (for example,
 	// it needs a lock held by the goroutine), that small preemption turns
 	// into a real deadlock.
+	// 再次检测各项条件，如果其中满足任一项，则放弃本次抢占
+	// 1. 已禁用抢占
+	// 2. 当前正在执行内存分配
+	// 3. 已关闭抢占机制
+	// 4. 处于系统调用阶段
 	if preempt {
 		if thisg.m.locks != 0 || thisg.m.mallocing != 0 || thisg.m.preemptoff != "" || thisg.m.p.ptr().status != _Prunning {
 			// Let the goroutine keep running for now.
 			// gp->preempt is set, so it will be preempted next time.
+			// 保持当前协程继续运行
+			// 由于设置了gp.preempt=true,所以下次会发生抢占
 			gp.stackguard0 = gp.stack.lo + _StackGuard
 			gogo(&gp.sched) // never return
 		}
@@ -1032,6 +1048,7 @@ func newstack() {
 
 		// Act like goroutine called runtime.Gosched.
 		casgstatus(gp, _Gwaiting, _Grunning)
+		// 调用函数go_preempt_m让出当前处理器 （类似调用runtime.Gosched）
 		gopreempt_m(gp) // never return
 	}
 
@@ -1064,6 +1081,9 @@ func nilfunc() {
 
 // adjust Gobuf as if it executed a call to fn
 // and then did an immediate gosave.
+// 当协程被调度执行时，通过JMP指令跳转到g.sched.pc处，也就是开始执行fn。
+// 按照正常的ABI规范，fn首先取到所需的参数，然后当fn执行完成后，会将模拟记录的PC寄存器值恢复，
+// 从而达到在每个协程执行完成后执行goexit的目的。goexit的具体内容我们在后边章节详细讲解。
 func gostartcallfn(gobuf *gobuf, fv *funcval) {
 	var fn unsafe.Pointer
 	if fv != nil {

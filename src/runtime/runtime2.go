@@ -24,20 +24,24 @@ const (
 	// in mgcmark.go too.
 
 	// _Gidle means this goroutine was just allocated and has not yet been initialized.
+	// G刚刚被创建,尚未初始化
 	_Gidle = iota // 0
 
 	// _Grunnable means this goroutine is on a run queue. It is
 	// not currently executing user code. The stack is not owned.
+	// G处于本地或者全局待运行队列中,准备运行,未持有可用栈
 	_Grunnable // 1
 
 	// _Grunning means this goroutine may execute user code. The
 	// stack is owned by this goroutine. It is not on a run queue.
 	// It is assigned an M and a P.
+	// G正在运行中,持有可用栈,未处于待运行队列中,和M绑定
 	_Grunning // 2
 
 	// _Gsyscall means this goroutine is executing a system call.
 	// It is not executing user code. The stack is owned by this
 	// goroutine. It is not on a run queue. It is assigned an M.
+	// G正处于系统调用中,持有可用栈,未处于待运行队列中,和M绑定
 	_Gsyscall // 3
 
 	// _Gwaiting means this goroutine is blocked in the runtime.
@@ -48,6 +52,7 @@ const (
 	// write parts of the stack under the appropriate channel
 	// lock. Otherwise, it is not safe to access the stack after a
 	// goroutine enters _Gwaiting (e.g., it may get moved).
+	// G处于等待中,等待某条件满足,未运行用户代码,未处于待运行队列中,但是可以索引.
 	_Gwaiting // 4
 
 	// _Gmoribund_unused is currently unused, but hardcoded in gdb
@@ -58,6 +63,7 @@ const (
 	// It is not executing user code. It may or may not have a stack allocated.
 	// The G and its stack (if any) are owned by the M that is exiting the G or that obtained the G from the free list.
 	// G已中止
+	// 当前G未被使用,执行完用户代码处于复用队列中或者是刚初始化完成.
 	_Gdead // 6
 
 	// _Genqueue_unused is currently unused.
@@ -66,7 +72,7 @@ const (
 	// _Gcopystack means this goroutine's stack is being moved. It
 	// is not executing user code and is not on a run queue. The
 	// stack is owned by the goroutine that put it in _Gcopystack.
-	// G的栈正在扩展, 下一轮重试
+	// G的栈正在扩展, 下一轮重试.栈拷贝中,未运行用户代码,不位于待运行队列中
 	_Gcopystack // 8
 
 	// _Gscan combined with one of the above states other than
@@ -80,6 +86,7 @@ const (
 	//
 	// atomicstatus&~Gscan gives the state the goroutine will
 	// return to when the scan completes.
+	// 表示G的栈正处于GC扫描中,和其他状态一起使用
 	_Gscan         = 0x1000
 	_Gscanrunnable = _Gscan + _Grunnable // 0x1001
 	_Gscanrunning  = _Gscan + _Grunning  // 0x1002
@@ -89,11 +96,15 @@ const (
 
 const (
 	// P status
+	// P处于空闲状态,未运行用户代码,也没有运行调度循环.
 	_Pidle    = iota
-	// 仅此P允许从运行中更改。
+	// 仅此P允许从运行中更改。被M持有,运行用户代码或者运行调度
 	_Prunning // Only this P is allowed to change from _Prunning.
+	// 未运行用户代码,绑定的M在执行系统调用.此时可以被其他M偷取
 	_Psyscall
+	// 被M持有,处于STW阶段
 	_Pgcstop
+	// P不再被使用,当GOMAXPROCS缩小时会产生, 当GOMAXPROCS扩大时会再复用
 	_Pdead
 )
 
@@ -263,13 +274,21 @@ type gobuf struct {
 	// and restores it doesn't need write barriers. It's still
 	// typed as a pointer so that any other writes from Go get
 	// write barriers.
-	sp   uintptr
-	pc   uintptr
-	g    guintptr
+
+	// sp、pc和g的偏移量为libmach所知（硬编码）。
+	//
+	// ctxt对于GC来说是不寻常的：它可能是一个堆分配的funcval，所以GC需要跟踪它，但它需要从汇编中设置和清除，
+	// 在那里很难有写障碍。然而，ctxt实际上是一个保存的、活的寄存器，我们只在真实寄存器和gobuf之间交换它。
+	// 因此，在堆栈扫描过程中，我们把它当作一个根，这意味着保存和恢复它的汇编不需要写屏障。
+	// 它仍然被打造成一个指针，这样任何其他来自Go的写都会得到写入障碍。
+
+	sp   uintptr // 协程栈顶
+	pc   uintptr // 程序计数器
+	g    guintptr // 协程本身的引用
 	ctxt unsafe.Pointer
 	ret  sys.Uintreg
 	lr   uintptr
-	bp   uintptr // for GOEXPERIMENT=framepointer
+	bp   uintptr // for GOEXPERIMENT=framepointer 协程栈底
 }
 
 // sudog represents a g in a wait list, such as for sending/receiving
@@ -330,8 +349,12 @@ type wincallbackcontext struct {
 // Stack describes a Go execution stack.
 // The bounds of the stack are exactly [lo, hi),
 // with no implicit data structures on either side.
+// 栈描述了一个执行栈。
+// 栈的边界正好是[lo, hi]，两边没有隐含的数据结构。
 type stack struct {
+	// 栈顶
 	lo uintptr
+	// 栈底
 	hi uintptr
 }
 
@@ -343,25 +366,42 @@ type g struct {
 	// stackguard1 is the stack pointer compared in the C stack growth prologue.
 	// It is stack.lo+StackGuard on g0 and gsignal stacks.
 	// It is ~0 on other goroutine stacks, to trigger a call to morestackc (and crash).
+
+	// 堆栈参数。
+	// 堆栈描述了实际的堆栈内存。[stack.lo, stack.hi)。
+	// stackguard0是在Go堆栈增长序言中比较的堆栈指针。
+	// 它通常是 stack.lo+StackGuard，但可以是 StackPreempt 来触发抢占。
+	// stackguard1是在C语言堆栈增长序言中比较的堆栈指针。
+	// 在 g0 和 gsignal 堆栈上是 stack.lo+StackGuard。
+	// 在其他goroutine堆栈上是~0，以触发对morestackc的调用（和崩溃）。
+
+	// 当前G所持有的栈空间
 	stack       stack   // offset known to runtime/cgo
 	stackguard0 uintptr // offset known to liblink
 	stackguard1 uintptr // offset known to liblink
 
+	// 当前协程持有的panic链表
 	_panic         *_panic // innermost panic - offset known to liblink
+	// 协程持有的defer链表
 	_defer         *_defer // innermost defer
+	// 和当前协程绑定的m
 	m              *m      // current m; offset known to arm liblink
+	// 协程持有的调度信息
 	sched          gobuf
+	// 发生系统调用时的栈顶. gc时使用
 	syscallsp      uintptr        // if status==Gsyscall, syscallsp = sched.sp to use during gc
+	// 发生系统调用时的程序计数器
 	syscallpc      uintptr        // if status==Gsyscall, syscallpc = sched.pc to use during gc
 	stktopsp       uintptr        // expected sp at top of stack, to check in traceback
 	param          unsafe.Pointer // passed parameter on wakeup
+	// 协程状态,详情参考2.1.2章节表
 	atomicstatus   uint32
 	stackLock      uint32 // sigprof/scang lock; TODO: fold in to atomicstatus
 	goid           int64
 	schedlink      guintptr
 	waitsince      int64      // approx time when the g become blocked
 	waitreason     waitReason // if status==Gwaiting
-	// 抢占信号，抢占标志，如果需要抢占就将preempt设置为true
+	// 抢占信号，抢占标志，如果需要抢占就将preempt设置为true。是否对当前协程发起抢占
 	preempt        bool       // preemption signal, duplicates stackguard0 = stackpreempt
 	paniconfault   bool       // panic (instead of crash) on unexpected fault address
 	preemptscan    bool       // preempted g does scan for gc
@@ -373,6 +413,7 @@ type g struct {
 	sysexitticks   int64      // cputicks when syscall has returned (for tracing)
 	traceseq       uint64     // trace event sequencer
 	tracelastp     puintptr   // last P emitted an event for this goroutine
+	// 和当前协程锁定的M.一旦G和M锁定,则只有锁定的M才可以运行当前G.
 	lockedm        muintptr
 	sig            uint32
 	writebuf       []byte
@@ -402,29 +443,43 @@ type g struct {
 }
 
 type m struct {
+	// g0是一个特殊的Goroutine，它的调度信息中记录了mstart函数的PC、SP信息，
+	// 它的栈空间比较大，为调度循环的执行提供内存空间。此外它还有一些其他职责，
+	// 比如创建Goroutine，垃圾回收等等。
 	g0      *g     // goroutine with scheduling stack
+	// 扩栈时使用的协程调度参数
 	morebuf gobuf  // gobuf arg to morestack
 	divmod  uint32 // div/mod denominator for arm - known to liblink
 
 	// Fields not known to debuggers.
+	// 操作系统线程ID
 	procid        uint64       // for debuggers, but offset not hard-coded
 	gsignal       *g           // signal-handling g
 	goSigStack    gsignalStack // Go-allocated signal handling stack
 	sigmask       sigset       // storage for saved signal mask
+	// 线程本地存储
 	tls           [6]uintptr   // thread-local storage (for x86 extern register)
+	// 每个M在启动前首先执行的方法
 	mstartfn      func()
+	// 正在当前M上运行的G
 	curg          *g       // current running goroutine
 	caughtsig     guintptr // goroutine running during fatal signal
+	// 当前M所持有的P。M只有持有P的时候才可以运行用户代码
 	p             puintptr // attached p for executing go code (nil if not executing go code)
+	// M在被唤起时优先尝试获取的P。
 	nextp         puintptr
+	// 进入系统调用前保存的P，当系统调用结束后会优先尝试获取。
 	oldp          puintptr // the p that was attached before executing a syscall
+	// 处理器的ID，只用于调试
 	id            int64
 	mallocing     int32
 	throwing      int32
+	// 当值不为空时，保留G绑定当前M运行，不允许抢占
 	preemptoff    string // if != "", keep curg running on this m
 	locks         int32
 	dying         int32
 	profilehz     int32
+	// 自旋状态，处于自旋状态的线程未执行用于代码，正在寻找任务。
 	spinning      bool // m is out of work and is actively looking for work
 	blocked       bool // m is blocked on a note
 	inwb          bool // m is executing a write barrier
@@ -439,10 +494,13 @@ type m struct {
 	ncgo          int32       // number of cgo calls currently in progress
 	cgoCallersUse uint32      // if non-zero, cgoCallers in use temporarily
 	cgoCallers    *cgoCallers // cgo traceback if crashing in cgo call
+	// 信号量，通知系统线程休眠或者唤醒系统线程
 	park          note
+	// 存在全局变量allm,是一个单向链表，可以索引到全部m对象
 	alllink       *m // on allm
 	schedlink     muintptr
 	mcache        *mcache
+	// 和当前M绑定的G，一旦绑定，则M只能运行绑定的G，绑定的G只能在绑定的M上运行，一旦G不满足运行条件，则G，M都会陷入休眠
 	lockedg       guintptr
 	createstack   [32]uintptr    // stack that created this thread.
 	lockedExt     uint32         // tracking for external LockOSThread
@@ -453,6 +511,7 @@ type m struct {
 	waittraceev   byte
 	waittraceskip int
 	startingtrace bool
+	// 系统调用计数器
 	syscalltick   uint32
 	thread        uintptr // thread handle
 	freelink      *m      // on sched.freem
@@ -474,13 +533,20 @@ type m struct {
 type p struct {
 	lock mutex
 
+	// 当前P的编号
 	id          int32
+	// P的状态,具体参见章节2.2.2表
 	status      uint32 // one of pidle/prunning/...
 	link        puintptr
+	// 每完成一次调度循环该字段+1
 	schedtick   uint32     // incremented on every scheduler call
+	// 每完成一次系统调用该字段+1
 	syscalltick uint32     // incremented on every system call
+	// 系统监控进程的最后一个循环计数.系统监控每完成一次循环tick+1
 	sysmontick  sysmontick // last tick observed by sysmon
+	// P持有的M
 	m           muintptr   // back-link to associated m (nil if idle)
+	// P持有的mspan缓存
 	mcache      *mcache
 	racectx     uintptr
 
@@ -492,8 +558,11 @@ type p struct {
 	goidcacheend uint64
 
 	// Queue of runnable goroutines. Accessed without lock.
+	// 可运行队列对头
 	runqhead uint32
+	// 可运行队列队尾
 	runqtail uint32
+	// 组成可运行队列的数组
 	runq     [256]guintptr
 	// runnext, if non-nil, is a runnable G that was ready'd by
 	// the current G and should be run next instead of what's in
@@ -504,10 +573,13 @@ type p struct {
 	// unit and eliminates the (potentially large) scheduling
 	// latency that otherwise arises from adding the ready'd
 	// goroutines to the end of the run queue.
+	// 优先运行的G缓存
 	runnext guintptr
 
 	// Available G's (status == Gdead)
+	// 待复用的G列表,运行结束的G会进入该列表
 	gFree struct {
+		// 可复用G链表
 		gList
 		n int32
 	}

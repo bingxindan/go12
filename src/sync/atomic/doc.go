@@ -37,6 +37,38 @@
 // functions, are the atomic equivalents of "return *addr" and
 // "*addr = val".
 //
+// atomic包提供了低级别的原子内存原语
+// 对实现同步算法非常有用。
+//
+// 这些函数需要非常小心才能正确使用。
+// 除了特殊的、低级别的应用外，同步最好是用通道或其他设施来完成。
+// 用通道或sync包的设施来完成。
+// 通过通信来共享内存。
+// 不要通过共享内存进行通信。
+//
+// 由SwapT函数实现的交换操作是原子性的等价物。
+//
+//	old = *addr
+//	*addr = new
+//	return old
+//
+// 比较和交换操作，由CompareAndSwapT实现。
+// 函数实现的，是原子等效的。
+//
+//	if *addr == old {
+//		*addr = new
+//		return true
+//	}
+//	return false
+//
+// 由 AddT 函数实现的添加操作，是原子性的等价物。
+//
+//	*addr += delta
+//	return *addr
+//
+// 通过LoadT和StoreT实现的加载和存储操作
+// 函数实现的，是 "返回 *addr "和 "*addr = val "的原子等价物。
+// "*addr = val"。
 package atomic
 
 import (

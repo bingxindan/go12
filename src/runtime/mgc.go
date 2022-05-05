@@ -163,6 +163,7 @@ var heapminimum uint64 = defaultHeapMinimum
 const defaultHeapMinimum = 4 << 20
 
 // Initialized from $GOGC.  GOGC=off means no GC.
+// 从$GOGC初始化。 GOGC=off意味着没有GC。
 var gcpercent int32
 
 func gcinit() {
@@ -338,6 +339,7 @@ type gcControllerState struct {
 	// Currently this is the bytes of heap scanned. For most uses,
 	// this is an opaque unit of work, but for estimation the
 	// definition is important.
+	// 已扫描的对象数量
 	scanWork int64
 
 	// bgScanCredit is the scan work credit accumulated by the
@@ -552,6 +554,10 @@ func (c *gcControllerState) revise() {
 	// (scanWork), so allocation will change this difference will
 	// slowly in the soft regime and not at all in the hard
 	// regime.
+
+	// 计算剩余的扫描工作估算。
+	// 注意，我们目前将GC期间的分配算作可扫描堆(heap_scan)和扫描工作完成(scanWork)，所以分配在软制度下会慢慢改变这个差异，而在硬制度下则完全不会。
+	// 等待扫描的对象数量 = 未扫描的对象数量 - 已扫描的对象数量
 	scanWorkRemaining := scanWorkExpected - c.scanWork
 	if scanWorkRemaining < 1000 {
 		// We set a somewhat arbitrary lower bound on
@@ -566,6 +572,9 @@ func (c *gcControllerState) revise() {
 	}
 
 	// Compute the heap distance remaining.
+	
+	// 距离触发GC的Heap大小 = 期待触发GC的Heap大小 - 当前的Heap大小
+	// 注意next_gc的计算跟gc_trigger不一样, next_gc等于heap_marked * (1 + gcpercent / 100)
 	heapRemaining := heapGoal - int64(live)
 	if heapRemaining <= 0 {
 		// This shouldn't happen, but if it does, avoid
@@ -576,17 +585,22 @@ func (c *gcControllerState) revise() {
 	// Compute the mutator assist ratio so by the time the mutator
 	// allocates the remaining heap bytes up to next_gc, it will
 	// have done (or stolen) the remaining amount of scan work.
+	// 每分配1 byte需要辅助扫描的对象数量 = 等待扫描的对象数量 / 距离触发GC的Heap大小
 	c.assistWorkPerByte = float64(scanWorkRemaining) / float64(heapRemaining)
 	c.assistBytesPerWork = float64(heapRemaining) / float64(scanWorkRemaining)
 }
 
 // endCycle computes the trigger ratio for the next cycle.
+// triggerRatio在每次GC后都会调整, 计算triggerRatio的函数是encCycle, 公式
+// endCycle计算下一个周期的触发率。
 func (c *gcControllerState) endCycle() float64 {
 	if work.userForced {
 		// Forced GC means this cycle didn't start at the
 		// trigger, so where it finished isn't good
 		// information about how to adjust the trigger.
 		// Just leave it where it is.
+		// 强制GC意味着这个周期并不是触发的，所以它在哪里结束并不是很重要。
+		// 就让它留在原地吧。
 		return memstats.triggerRatio
 	}
 
@@ -595,6 +609,8 @@ func (c *gcControllerState) endCycle() float64 {
 	// take longer to respond to phase changes. Higher values
 	// react to phase changes quickly, but are more affected by
 	// transient changes. Values near 1 may be unstable.
+	// 触发控制器的比例响应增益。必须在[0, 1]中。较低的值可以平滑瞬时效应，但需要更长的时间来响应相位变化。
+	// 较高的值对相位变化的反应很快，但受瞬态变化的影响更大。瞬态变化的影响。接近1的值可能是不稳定的。
 	const triggerGain = 0.5
 
 	// Compute next cycle trigger ratio. First, this computes the
@@ -606,21 +622,34 @@ func (c *gcControllerState) endCycle() float64 {
 	// growth if we had the desired CPU utilization). The
 	// difference between this estimate and the GOGC-based goal
 	// heap growth is the error.
+
+	// 目标Heap增长率, 默认是1.0
 	goalGrowthRatio := float64(gcpercent) / 100
+	// 实际Heap增长率, 等于总大小/存活大小-1
 	actualGrowthRatio := float64(memstats.heap_live)/float64(memstats.heap_marked) - 1
+	// GC标记阶段的使用时间(因为endCycle是在Mark Termination阶段调用的)
 	assistDuration := nanotime() - c.markStartTime
 
 	// Assume background mark hit its utilization goal.
+	// GC标记阶段的CPU占用率, 目标值是0.25
 	utilization := gcBackgroundUtilization
 	// Add assist utilization; avoid divide by zero.
 	if assistDuration > 0 {
+		// assistTime是G辅助GC标记对象所使用的时间合计
+		// (nanosecnds spent in mutator assists during this cycle)
+		// 额外的CPU占用率 = 辅助GC标记对象的总时间 / (GC标记使用时间 * P的数量)
 		utilization += float64(c.assistTime) / float64(assistDuration*int64(gomaxprocs))
 	}
 
+	// 触发系数偏移值 = 目标增长率 - 原触发系数 - CPU占用率 / 目标CPU占用率 * (实际增长率 - 原触发系数)
+	// 参数的分析:
+	// 实际增长率越大, 触发系数偏移值越小, 小于0时下次触发GC会提早
+	// CPU占用率越大, 触发系数偏移值越小, 小于0时下次触发GC会提早
+	// 原触发系数越大, 触发系数偏移值越小, 小于0时下次触发GC会提早
 	triggerError := goalGrowthRatio - memstats.triggerRatio - utilization/gcGoalUtilization*(actualGrowthRatio-memstats.triggerRatio)
 
-	// Finally, we adjust the trigger for next time by this error,
-	// damped by the proportional gain.
+	// Finally, we adjust the trigger for next time by this error, damped by the proportional gain.
+	// 根据偏移值调整触发系数, 每次只调整偏移值的一半(渐进式调整)
 	triggerRatio := memstats.triggerRatio + triggerGain*triggerError
 
 	if debug.gcpacertrace > 0 {
@@ -797,15 +826,24 @@ func pollFractionalWorkerExit() bool {
 // memstats.heap_live. These must be up to date.
 //
 // mheap_.lock must be held or the world must be stopped.
+
+// gcSetTriggerRatio设置触发率，并更新由它派生出来的所有东西：绝对触发器、堆目标、标记节奏和扫频节奏。
+// 这可以在任何时候被调用。如果GC处于一个并发阶段的中间，它将调整该阶段的节奏。
+// 这取决于gcpercent, memstats.heap_marked, 和 memstats.heap_live。这些必须是最新的。
+// mheap_.lock必须被持有，否则世界必须被停止。
 func gcSetTriggerRatio(triggerRatio float64) {
 	// Set the trigger ratio, capped to reasonable bounds.
+	// 设置触发率，以合理的界限为上限。
 	if triggerRatio < 0 {
 		// This can happen if the mutator is allocating very
 		// quickly or the GC is scanning very slowly.
+		// 如果突变器的分配速度非常快，或者GC的扫描速度非常慢，就会发生这种情况。
+		// 或者GC的扫描速度很慢，就会出现这种情况。
 		triggerRatio = 0
 	} else if gcpercent >= 0 {
 		// Ensure there's always a little margin so that the
 		// mutator assist ratio isn't infinity.
+		// 确保总是有一点余地，保证突变器辅助率不是无限大。
 		maxTriggerRatio := 0.95 * float64(gcpercent) / 100
 		if triggerRatio > maxTriggerRatio {
 			triggerRatio = maxTriggerRatio
@@ -819,6 +857,7 @@ func gcSetTriggerRatio(triggerRatio float64) {
 	// grown by the trigger ratio over the marked heap size.
 	trigger := ^uint64(0)
 	if gcpercent >= 0 {
+		// 下次触发GC需要的分配量 = 当前标记存活的大小乘以1+系数triggerRatio
 		trigger = uint64(float64(memstats.heap_marked) * (1 + triggerRatio))
 		// Don't trigger below the minimum heap size.
 		minTrigger := heapminimum
@@ -875,6 +914,9 @@ func gcSetTriggerRatio(triggerRatio float64) {
 		// trigger. Compute the ratio of in-use pages to sweep
 		// per byte allocated, accounting for the fact that
 		// some might already be swept.
+
+		// 距离触发GC的Heap大小 = 期待触发GC的Heap大小 - 当前的Heap大小
+		// 注意next_gc的计算跟gc_trigger不一样, next_gc等于heap_marked * (1 + gcpercent / 100)
 		heapLiveBasis := atomic.Load64(&memstats.heap_live)
 		heapDistance := int64(trigger) - int64(heapLiveBasis)
 		// Add a little margin so rounding errors and
@@ -885,11 +927,14 @@ func gcSetTriggerRatio(triggerRatio float64) {
 			// Avoid setting the sweep ratio extremely high
 			heapDistance = _PageSize
 		}
+		// 已清扫的页数
 		pagesSwept := atomic.Load64(&mheap_.pagesSwept)
+		// 未清扫的页数 = 使用中的页数 - 已清扫的页数
 		sweepDistancePages := int64(mheap_.pagesInUse) - int64(pagesSwept)
 		if sweepDistancePages <= 0 {
 			mheap_.sweepPagesPerByte = 0
 		} else {
+			// 每分配1 byte(的span)需要辅助清扫的页数 = 未清扫的页数 / 距离触发GC的Heap大小
 			mheap_.sweepPagesPerByte = float64(sweepDistancePages) / float64(heapDistance)
 			mheap_.sweepHeapLiveBasis = heapLiveBasis
 			// Write pagesSweptBasis last, since this
@@ -915,6 +960,12 @@ const gcGoalUtilization = 0.30
 // better control CPU and heap growth. However, the larger the gap,
 // the more mutator assists are expected to happen, which impact
 // mutator latency.
+
+// gcBackgroundUtilization是后台标记的固定CPU利用率。它必须 <= gcGoalUtilization。
+// gcGoalUtilization和gcBackgroundUtilization之间的差额将由标记辅助来弥补。
+// 调度器的目标是使用这个目标的50%以内。
+// 将此设置为< gcGoalUtilization，可以避免在没有助攻的情况下触发反馈控制器的饱和，这可以使它更好地控制CPU和堆的增长。
+// 然而，差距越大，预计会有更多的突变器协助发生，这影响了突变器的延迟。
 const gcBackgroundUtilization = 0.25
 
 // gcCreditSlack is the amount of scan work credit that can
@@ -1015,6 +1066,7 @@ var work struct {
 
 	// userForced indicates the current GC cycle was forced by an
 	// explicit user call.
+	// userForced表示当前的GC周期是由一个明确的用户调用。
 	userForced bool
 
 	// totaltime is the CPU nanoseconds spent in GC since the
@@ -1190,6 +1242,7 @@ const (
 	// gcTriggerTime indicates that a cycle should be started when
 	// it's been more than forcegcperiod nanoseconds since the
 	// previous GC cycle.
+	// gcTriggerTime表示，当一个周期距离上一个GC周期超过forcegcperiod纳秒时，就应该开始。循环。
 	gcTriggerTime
 
 	// gcTriggerCycle indicates that a cycle should be started if
@@ -1222,6 +1275,7 @@ func (t gcTrigger) test() bool {
 		if gcpercent < 0 {
 			return false
 		}
+		// forcegcperiod的定义是2分钟, 也就是2分钟内没有执行过GC就会强制触发.
 		lastgc := int64(atomic.Load64(&memstats.last_gc_nanotime))
 		return lastgc != 0 && t.now-lastgc > forcegcperiod
 	case gcTriggerCycle:
@@ -1899,6 +1953,7 @@ func gcMarkTermination(nextTriggerRatio float64) {
 // These goroutines will not run until the mark phase, but they must
 // be started while the work is not stopped and from a regular G
 // stack. The caller must hold worldsema.
+// 这里虽然为每个P启动了一个后台标记任务, 但是可以同时工作的只有25%, 这个逻辑在协程M获取G时调用的findRunnableGCWorker中
 // 函数gcBgMarkStartWorkers用于启动后台标记任务, 先分别对每个P启动一个
 func gcBgMarkStartWorkers() {
 	// Background marking is performed by per-P G's. Ensure that
@@ -1967,7 +2022,6 @@ func gcBgMarkWorker(_p_ *p) {
 	在此之后，背景标记工作进程由gcController.findRunnable协同调度。
 	因此，它决不能被抢占，因为这会将它放入_Grunnable并放入运行队列。
 	相反，当设置了preempt标志时，这会将自身置于等待gcController.findRunnable在适当的时间唤醒的状态。
-
 	调度过程中调用stopm()睡眠后，通过 notewakeup(&mp.park)恢复m的执行，并从stopm()的位置开始执行，重新调度。
 	*/
 	notewakeup(&work.bgMarkReady)

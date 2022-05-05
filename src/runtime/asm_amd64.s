@@ -11,6 +11,8 @@
 // internal linking. This is the entry point for the program from the
 // kernel for an ordinary -buildmode=exe program. The stack holds the
 // number of arguments and the C-style argv.
+// 方法_rt0_amd64首先把应用的传入参数argc和argv传入DI，SI寄存器，然后紧接着调用了方法_rt0_go启动了整个Go程序。接下来我们分段介绍下_rt0_go的核心代码
+// 首先是将应用程序的启动参数保存在栈上，系统会开辟32字节的空间，16字节保存参数，16字节保留，同时还会对内存进行16字节对齐。
 TEXT _rt0_amd64(SB),NOSPLIT,$-8
 	MOVQ	0(SP), DI	// argc
 	LEAQ	8(SP), SI	// argv
@@ -84,18 +86,23 @@ GLOBL _rt0_amd64_lib_argc<>(SB),NOPTR, $8
 DATA _rt0_amd64_lib_argv<>(SB)/8, $0
 GLOBL _rt0_amd64_lib_argv<>(SB),NOPTR, $8
 
+// 首先是将应用程序的启动参数保存在栈上，系统会开辟32字节的空间，16字节保存参数，16字节保留，同时还会对内存进行16字节对齐。
 TEXT runtime·rt0_go(SB),NOSPLIT,$0
 	// copy arguments forward on an even stack
+	// 开辟4个8字节空间 并调整16比特对齐
 	MOVQ	DI, AX		// argc
 	MOVQ	SI, BX		// argv
 	SUBQ	$(4*8+7), SP		// 2args 2auto
 	ANDQ	$~15, SP
+	// 将argc,argv两个传入参数保存到栈上
 	MOVQ	AX, 16(SP)
 	MOVQ	BX, 24(SP)
 
 	// create istack out of the given (operating system) stack.
 	// _cgo_init may update stackguard.
+	// 接下来开辟g0的栈空间，大小为64K-104
 	MOVQ	$runtime·g0(SB), DI
+	// 开辟g0的栈，大小64K-104
 	LEAQ	(-64*1024+104)(SP), BX
 	MOVQ	BX, g_stackguard0(DI)
 	MOVQ	BX, g_stackguard1(DI)
@@ -148,6 +155,9 @@ nocpuinfo:
 	JMP ok
 #endif
 needtls:
+// 设置线程本地存储TLS(Thread Local Storage). 简单来说，TLS是一种机制，通过它程序可以拥有全局变量，
+// 但是处于每一个线程各不相同的状态。编码时，代码可以写成一样的，但是从TLS中取到的值每个线程各不相同，
+// 变量既分属各线程，却又可以享受全局变量的便利。
 #ifdef GOOS_plan9
 	// skip TLS setup on Plan 9
 	JMP ok
@@ -161,10 +171,12 @@ needtls:
 	JMP ok
 #endif
 
+    // 设置TLS。【GOOS_plan9，GOOS_solaris，GOOS_illumos，GOOS_darwin】需要跳过TLS的设置。
 	LEAQ	runtime·m0+m_tls(SB), DI
 	CALL	runtime·settls(SB)
 
 	// store through it, to make sure it works
+	// 检测TLS是否可用
 	get_tls(BX)
 	MOVQ	$0x123, g(BX)
 	MOVQ	runtime·m0+m_tls(SB), AX
@@ -172,6 +184,7 @@ needtls:
 	JEQ 2(PC)
 	CALL	runtime·abort(SB)
 ok:
+    // TLS设置成功后会将g0写入。然后将m0和g0进行绑定。
 	// set the per-goroutine and per-mach "registers"
 	get_tls(BX)
 	LEAQ	runtime·g0(SB), CX
@@ -179,6 +192,7 @@ ok:
 	LEAQ	runtime·m0(SB), AX
 
 	// save m->g0 = g0
+	// g0写入tls的位置
 	MOVQ	CX, m_g0(AX)
 	// save m0 to g0->m
 	MOVQ	AX, g_m(CX)
@@ -186,21 +200,34 @@ ok:
 	CLD				// convention is D is always left cleared
 	CALL	runtime·check(SB)
 
+// 接下来将程序参数拷贝到调用栈参数的位置，并调用参数初始化函数runtime·args对参数进行初始化
+
 	MOVL	16(SP), AX		// copy argc
 	MOVL	AX, 0(SP)
 	MOVQ	24(SP), AX		// copy argv
 	MOVQ	AX, 8(SP)
 	CALL	runtime·args(SB)
+	// 函数runtime·osinit主要做了两个事情，一是确定CPU的核数，在接下来初始化调度器时，P的个数将和CPU核数保持一致(如未人为修改)；
+	// 二是获取操作系统默认的内存页大小，用于内存管理。
+	// 操作系统初始化
 	CALL	runtime·osinit(SB)
+	// schedinit是本阶段的核心函数，负责协程调度器的初始化工作
+	// 调度器初始化
 	CALL	runtime·schedinit(SB)
 
+// 调度器初始化完成后，程序紧接着使用runtime·newproc创建了main协程。协程的具体创建过程参见下文描述。
+
 	// create a new goroutine to start program
+	// 入口函数，runtime.mainPC就是runtime.main
 	MOVQ	$runtime·mainPC(SB), AX		// entry
 	PUSHQ	AX
 	PUSHQ	$0			// arg size
+	// 创建新的Goroutine启动程序, 执行的方法就是runtime.main
 	CALL	runtime·newproc(SB)
 	POPQ	AX
 	POPQ	AX
+
+// 接下来就是启动M，mstart是所有新M创建后的入口函数，这也就是说除了在系统启动阶段会运行之外，每个M被创建后都会先运行mstart。
 
 	// start this M
 	CALL	runtime·mstart(SB)
@@ -250,21 +277,31 @@ TEXT runtime·gosave(SB), NOSPLIT, $0-8
 
 // func gogo(buf *gobuf)
 // restore state from Gobuf; longjmp
+// 函数gogo为汇编实现，在amd64平台源码如下：
+// 函数gogo的实现非常有意思，配合我们上文在协程创建处提到的模拟被goexit调用，
+// 组成了一次看似常规的函数调用：协程的入口函数fn被goexit调用，当fn执行完毕后，会返回goexit继续执行。
 TEXT runtime·gogo(SB), NOSPLIT, $16-8
+    // 传入参数，gp.sched
 	MOVQ	buf+0(FP), BX		// gobuf
 	MOVQ	gobuf_g(BX), DX
 	MOVQ	0(DX), CX		// make sure g != nil
+	// 将TLS的内存地址赋值给CX
 	get_tls(CX)
+	// 将需要运行的gp写入TLS
 	MOVQ	DX, g(CX)
+	// 将gp的各参数赋值到寄存器： SP，BP
 	MOVQ	gobuf_sp(BX), SP	// restore SP
 	MOVQ	gobuf_ret(BX), AX
 	MOVQ	gobuf_ctxt(BX), DX
 	MOVQ	gobuf_bp(BX), BP
+	// 清空gp.sched
 	MOVQ	$0, gobuf_sp(BX)	// clear to help garbage collector
 	MOVQ	$0, gobuf_ret(BX)
 	MOVQ	$0, gobuf_ctxt(BX)
 	MOVQ	$0, gobuf_bp(BX)
+	// BX=PC,gp接下来运行的指令赋值给寄存器BX，也就是g的入口方法
 	MOVQ	gobuf_pc(BX), BX
+	// 直接跳转到PC的位置
 	JMP	BX
 
 // func mcall(fn func(*g))
@@ -385,8 +422,13 @@ bad:
 // the top of a stack (for example, morestack calling newstack
 // calling the scheduler calling newm calling gc), so we must
 // record an argument size. For that purpose, it has no arguments.
+// 1. 环境检查，g0栈和信号量栈上不允许发生扩栈&抢占
+// 2. 将发生扩栈函数的父级函数的SP，PC，g三个核心变量记录在m.morebuf中
+// 3. 更新g.sched值为当前发生扩栈的函数的相关值
+// 4. 在g0栈上调用newstack
 TEXT runtime·morestack(SB),NOSPLIT,$0-0
 	// Cannot grow scheduler stack (m->g0).
+	// m.g0栈上不允许发生扩栈
 	get_tls(CX)
 	MOVQ	g(CX), BX
 	MOVQ	g_m(BX), BX
@@ -397,6 +439,7 @@ TEXT runtime·morestack(SB),NOSPLIT,$0-0
 	CALL	runtime·abort(SB)
 
 	// Cannot grow signal stack (m->gsignal).
+	// 信号栈上不允许发生扩栈
 	MOVQ	m_gsignal(BX), SI
 	CMPQ	g(CX), SI
 	JNE	3(PC)
@@ -405,6 +448,7 @@ TEXT runtime·morestack(SB),NOSPLIT,$0-0
 
 	// Called from f.
 	// Set m->morebuf to f's caller.
+	// 通过m.morebuf记录扩栈发生时父级函数的PC，SP和g
 	MOVQ	8(SP), AX	// f's caller's PC
 	MOVQ	AX, (m_morebuf+gobuf_pc)(BX)
 	LEAQ	16(SP), AX	// f's caller's SP
@@ -414,6 +458,7 @@ TEXT runtime·morestack(SB),NOSPLIT,$0-0
 	MOVQ	SI, (m_morebuf+gobuf_g)(BX)
 
 	// Set g->sched to context in f.
+	// 更新扩栈发生时g.sched值为扩栈发生的函数相关值
 	MOVQ	0(SP), AX // f's PC
 	MOVQ	AX, (g_sched+gobuf_pc)(SI)
 	MOVQ	SI, (g_sched+gobuf_g)(SI)
@@ -423,6 +468,7 @@ TEXT runtime·morestack(SB),NOSPLIT,$0-0
 	MOVQ	DX, (g_sched+gobuf_ctxt)(SI)
 
 	// Call newstack on m->g0's stack.
+	// m.g0栈上调用函数newstack
 	MOVQ	m_g0(BX), BX
 	MOVQ	BX, g(CX)
 	MOVQ	(g_sched+gobuf_sp)(BX), SP
@@ -431,6 +477,19 @@ TEXT runtime·morestack(SB),NOSPLIT,$0-0
 	RET
 
 // morestack but not preserving ctxt.
+// 试想一下，如果协程不会主动让出处理器，那么还是会存在其他协程得不到执行到场景，针对此问题，
+// Go语言在1.2版本中引入了基于协作式的抢占调度。
+
+// 1. 编译器在函数调用开始位置插入栈帧大小检查代码，当发生函数调用时，首先会检查栈帧大小，一旦检查条件成立，
+// 则系统会执行编译器插入的`runtime.morestack_noctxt`函数，
+// 函数内会检查协程的`stackguard0`字段是否为`StackPreempt`,`preempt`字段是否为`true`，一旦上述两个条件成立，
+// 则会触发抢占，让出当前处理器。
+
+// 2. 运行时会通过系统监控发现协程运行超过10ms时发出抢占请求，设置`stackguard0=StackPreempt`,`preempt=true`。
+
+// 编译器插入的自动检查栈帧大小的代码，用于扩栈&抢占
+
+// 函数morestack_noctxt在当前版本兼职扩栈和抢占两个功能，在此我们只关心抢占部分。
 TEXT runtime·morestack_noctxt(SB),NOSPLIT,$0
 	MOVL	$0, DX
 	JMP	runtime·morestack(SB)
@@ -1333,6 +1392,8 @@ TEXT _cgo_topofstack(SB),NOSPLIT,$0
 
 // The top-most function running on a goroutine
 // returns to goexit+PCQuantum.
+// 协程退出
+// 当协程的入口函数执行完成后，程序会跳转到goexit的位置继续执行。
 TEXT runtime·goexit(SB),NOSPLIT,$0-0
 	BYTE	$0x90	// NOP
 	CALL	runtime·goexit1(SB)	// does not return

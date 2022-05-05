@@ -61,13 +61,21 @@ func (t *timer) assignBucket() *timersBucket {
 
 //go:notinheap
 type timersBucket struct {
+	// 锁，多个P绑定一个tb时生效
 	lock         mutex
+	// 定时器检查协程
 	gp           *g
+	// 桶协程是否已创建
 	created      bool
+	// 桶内包含timer，线程休眠
 	sleeping     bool
+	// 桶内没有timer，协程被挂起
 	rescheduling bool
+	// 线程休眠超时唤醒时间
 	sleepUntil   int64
+	// 线程休眠信号量
 	waitnote     note
+	// 定时器，最小四叉堆
 	t            []*timer
 }
 
@@ -128,9 +136,27 @@ func goroutineReady(arg interface{}, seq uintptr) {
 	goready(arg.(*g), 0)
 }
 
+// 每个定时器桶都会包含一个专用于检查定时器过期的协程，这个协程是懒加载的，在第一次向桶中添加timer时创建。
+// 我们先看下timer的添加过程
+
+/**
+整个定时器的实现过程会触发协程调度的地方比较多，概括起来如下
+
+1. 添加定时器：
+	a. 如果是第一次添加定时器到桶中，则会创建新的桶协程，并加入p的本地待运行g队列中，等待调度
+	b. 如果加入新定时器前桶协程为挂起状态，则通过方法`goready`唤醒桶
+	c. 如果加入新定时器前线程处于休眠状态，则唤醒线程
+
+2. 桶协程循环:
+	 a. 如果桶中不包含定时器，则通过`goparkunlock`将桶协程挂起。
+	 b. 如果堆顶的定时器未触发，则将当前线程休眠。休眠过程通过系统调用实现，可能会被剥离P
+	 c. 如果堆顶的定时器已触发，则向定时器持有的Channel发送数据。Channel的调度过程参考上节。
+ */
 func addtimer(t *timer) {
+	// 获取P关联的桶（根据p.id取模）
 	tb := t.assignBucket()
 	lock(&tb.lock)
+	// 将新的timer添加到桶中
 	ok := tb.addtimerLocked(t)
 	unlock(&tb.lock)
 	if !ok {
@@ -146,24 +172,31 @@ func addtimer(t *timer) {
 func (tb *timersBucket) addtimerLocked(t *timer) bool {
 	// when must never be negative; otherwise timerproc will overflow
 	// during its delta calculation and never expire other runtime timers.
+	// 负值保护
 	if t.when < 0 {
 		t.when = 1<<63 - 1
 	}
+	// 获取当前堆的长度并将新创建的timer放入队尾
 	t.i = len(tb.t)
 	tb.t = append(tb.t, t)
+	// 重新构建堆，最小堆
 	if !siftupTimer(tb.t, t.i) {
 		return false
 	}
+	// 如果添加前桶内没有定时器
 	if t.i == 0 {
 		// siftup moved to top: new earliest deadline.
+		// 如果当前线程处于休眠中，且到了需要唤醒的时间，则唤醒线程
 		if tb.sleeping && tb.sleepUntil > t.when {
 			tb.sleeping = false
 			notewakeup(&tb.waitnote)
 		}
+		// 如果当前协程处于挂起状态，则唤醒，加入全局待运行队列，等待调度
 		if tb.rescheduling {
 			tb.rescheduling = false
 			goready(tb.gp, 0)
 		}
+		// 如果是第一次添加timer 则创建调度协程
 		if !tb.created {
 			tb.created = true
 			go timerproc(tb)
@@ -244,24 +277,31 @@ func modtimer(t *timer, when, period int64, f func(interface{}, uintptr), arg in
 // Timerproc runs the time-driven events.
 // It sleeps until the next event in the tb heap.
 // If addtimer inserts a new earlier event, it wakes timerproc early.
+// 定时器桶协程的实现逻辑
 func timerproc(tb *timersBucket) {
 	tb.gp = getg()
 	for {
 		lock(&tb.lock)
+		// 重置线程休眠标识
 		tb.sleeping = false
 		now := nanotime()
+		// 第一个到期的定时器时间和当前时间的差值
 		delta := int64(-1)
 		for {
+			// 桶中不包含定时器
 			if len(tb.t) == 0 {
 				delta = -1
 				break
 			}
+			// 获取桶中最快到期的定时器，计算差值
 			t := tb.t[0]
 			delta = t.when - now
+			// 如果未到期，则执行当前for循环外流程，将当前线程休眠
 			if delta > 0 {
 				break
 			}
 			ok := true
+			// 如果是timer，则计算下次触发时间并重新调整桶
 			if t.period > 0 {
 				// leave in heap but adjust next time to fire
 				t.when += t.period * (1 + -delta/t.period)
@@ -270,6 +310,7 @@ func timerproc(tb *timersBucket) {
 				}
 			} else {
 				// remove from heap
+				// 将定时器在当前桶中删除
 				last := len(tb.t) - 1
 				if last > 0 {
 					tb.t[0] = tb.t[last]
@@ -284,7 +325,9 @@ func timerproc(tb *timersBucket) {
 				}
 				t.i = -1 // mark as removed
 			}
+			// 执行定时器的回调函数
 			f := t.f
+			// 如果是NewTimer创建的定时器，则f为sendTime
 			arg := t.arg
 			seq := t.seq
 			unlock(&tb.lock)
@@ -297,6 +340,7 @@ func timerproc(tb *timersBucket) {
 			f(arg, seq)
 			lock(&tb.lock)
 		}
+		// 当前桶中不包含定时器，将桶协程挂起
 		if delta < 0 || faketime > 0 {
 			// No timers left - put goroutine to sleep.
 			tb.rescheduling = true
@@ -304,6 +348,8 @@ func timerproc(tb *timersBucket) {
 			continue
 		}
 		// At least one timer pending. Sleep until then.
+		// 如果至少存在一个待到期的定时器，则将当前线程休眠，直到定时器到期
+		// 休眠过程中，g和m不解绑
 		tb.sleeping = true
 		tb.sleepUntil = now + delta
 		noteclear(&tb.waitnote)

@@ -87,6 +87,10 @@ type mstats struct {
 	// previous cycle. This should be ≤ GOGC/100 so the trigger
 	// heap size is less than the goal heap size. This is set
 	// during mark termination for the next cycle's trigger.
+
+	// triggerRatio是触发标记的堆增长比率。
+	// 例如，如果是0.6，那么GC应该在堆达到上一个周期标记的堆的1.6倍时开始。
+	// 这应该是≤GOGC/100，这样触发的堆大小就会小于目标堆大小。这将被设置为在标记终止期间为下一个周期的触发器设置。
 	triggerRatio float64
 
 	// gc_trigger is the heap size that triggers marking.
@@ -123,6 +127,11 @@ type mstats struct {
 	//
 	// Whenever this is updated, call traceHeapAlloc() and
 	// gcController.revise().
+
+	// heap_live是被GC认为有效的字节数。
+	// 也就是说：最近一次GC保留的字节数加上之后分配的字节数。
+	// heap_live <= heap_alloc，因为heap_alloc包括尚未被清空的未标记的对象（并且因此在分配时上升，在清扫时下降），
+	// 而heap_live不包括这些对象（因此只在GC之间上升）。
 	heap_live uint64
 
 	// heap_scan is the number of bytes of "scannable" heap. This
@@ -136,6 +145,7 @@ type mstats struct {
 	// GC. After mark termination, heap_live == heap_marked, but
 	// unlike heap_live, heap_marked does not change until the
 	// next mark termination.
+	// 当前标记存活的大小
 	heap_marked uint64
 }
 

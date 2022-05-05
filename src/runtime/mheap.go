@@ -1289,10 +1289,13 @@ func (h *mheap) freeSpan(s *mspan, large bool) {
 //
 //go:systemstack
 func (h *mheap) freeManual(s *mspan, stat *uint64) {
+	// span 在下次被分配走时需要对该段内存进行清零
 	s.needzero = 1
 	lock(&h.lock)
 	*stat -= uint64(s.npages << _PageShift)
+	// 记录并增加堆中的剩余空间
 	memstats.heap_sys += uint64(s.npages << _PageShift)
+	// 将其释放回堆中
 	h.freeSpanLocked(s, false, true, 0)
 	unlock(&h.lock)
 }
@@ -1312,6 +1315,7 @@ func (h *mheap) freeSpanLocked(s *mspan, acctinuse, acctidle bool, unusedsince i
 		h.pagesInUse -= uint64(s.npages)
 
 		// Clear in-use bit in arena page bitmap.
+		// 清除 arena page bitmap 正在使用的二进制位
 		arena, pageIdx, pageMask := pageIndexOf(s.base())
 		arena.pageInUse[pageIdx] &^= pageMask
 	default:
@@ -1334,9 +1338,11 @@ func (h *mheap) freeSpanLocked(s *mspan, acctinuse, acctidle bool, unusedsince i
 	}
 
 	// Coalesce span with neighbors.
+	// 与邻居进行结合
 	h.coalesce(s)
 
 	// Insert s into the appropriate treap.
+	// 插入回 treap
 	if s.scavenged {
 		h.scav.insert(s)
 	} else {
@@ -1911,6 +1917,9 @@ func newAllocBits(nelems uintptr) *gcBits {
 // - span完成sweep, 同上
 // - 开启新的markbit时代
 //   - 2个时代之前的bitmap将不再被使用, 可以复用这些bitmap
+
+// gcBitsArenas.previous被释放到gcBitsArenas.free列表中。
+// 原来的allocBits被释放到了gcBitsArenas.free列表中
 func nextMarkBitArenaEpoch() {
 	lock(&gcBitsArenas.lock)
 	if gcBitsArenas.previous != nil {
