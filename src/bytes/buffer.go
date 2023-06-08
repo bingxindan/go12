@@ -236,6 +236,9 @@ func makeSlice(n int) []byte {
 // The return value n is the number of bytes written; it always fits into an
 // int, but it is int64 to match the io.WriterTo interface. Any error
 // encountered during the write is also returned.
+// WriteTo向w写入数据，直到缓冲区被耗尽或发生错误。
+// 返回值n是写入的字节数；它总是适合于一个int，但它是int64，以配合io.WriterTo接口。
+// 任何错误 也会被返回。
 func (b *Buffer) WriteTo(w io.Writer) (n int64, err error) {
 	b.lastRead = opInvalid
 	if nBytes := b.Len(); nBytes > 0 {

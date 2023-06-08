@@ -141,6 +141,7 @@ func newosproc(mp *m) {
 	}
 
 	// Initialize an attribute object.
+	// 初始化一个属性对象。
 	var attr pthreadattr
 	var err int32
 	err = pthread_attr_init(&attr)
@@ -150,7 +151,9 @@ func newosproc(mp *m) {
 	}
 
 	// Set the stack size we want to use.  64KB for now.
+	// 设置我们要使用的堆栈大小。 目前为64KB。
 	// TODO: just use OS default size?
+	// 只是使用操作系统的默认尺寸？
 	const stackSize = 1 << 16
 	if pthread_attr_setstacksize(&attr, stackSize) != 0 {
 		write(2, unsafe.Pointer(&failthreadcreate[0]), int32(len(failthreadcreate)))
@@ -166,6 +169,7 @@ func newosproc(mp *m) {
 
 	// Finally, create the thread. It starts at mstart_stub, which does some low-level
 	// setup and then calls mstart.
+	// 最后，创建线程。它从mstart_stub开始，做一些低级的设置，然后调用mstart。
 	var oset sigset
 	// 线程克隆过程中屏蔽信号量
 	sigprocmask(_SIG_SETMASK, &sigset_all, &oset)

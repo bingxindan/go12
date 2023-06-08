@@ -1307,6 +1307,10 @@ func (t *Time) UnmarshalText(data []byte) error {
 // It is valid to pass nsec outside the range [0, 999999999].
 // Not all sec values have a corresponding time value. One such
 // value is 1<<63-1 (the largest int64 value).
+
+// Unix返回与给定的Unix时间相对应的本地时间，自1970年1月1日UTC以来的秒数和纳秒数。
+// 在[0, 999999999]范围之外传递nsec是有效的。
+// 不是所有的sec值都有相应的时间值。一个这样的值是1<<63-1（最大的int64值）。
 func Unix(sec int64, nsec int64) Time {
 	if nsec < 0 || nsec >= 1e9 {
 		n := nsec / 1e9

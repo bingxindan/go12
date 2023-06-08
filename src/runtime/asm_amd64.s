@@ -87,6 +87,8 @@ DATA _rt0_amd64_lib_argv<>(SB)/8, $0
 GLOBL _rt0_amd64_lib_argv<>(SB),NOPTR, $8
 
 // 首先是将应用程序的启动参数保存在栈上，系统会开辟32字节的空间，16字节保存参数，16字节保留，同时还会对内存进行16字节对齐。
+// 在 runtime·rt0_go 方法中，其主要是完成各类运行时的检查，系统参数设置和获取，并进行大量的 Go 基础组件初始化。
+// 初始化完毕后进行主协程（main goroutine）的运行，并放入等待队列（GMP 模型），最后调度器开始进行循环调度。
 TEXT runtime·rt0_go(SB),NOSPLIT,$0
 	// copy arguments forward on an even stack
 	// 开辟4个8字节空间 并调整16比特对齐
@@ -198,6 +200,8 @@ ok:
 	MOVQ	AX, g_m(CX)
 
 	CLD				// convention is D is always left cleared
+	// 运行时类型检查，主要是校验编译器的翻译工作是否正确，是否有 “坑”。
+	// 基本代码均为检查 int8 在 unsafe.Sizeof 方法下是否等于 1 这类动作。
 	CALL	runtime·check(SB)
 
 // 接下来将程序参数拷贝到调用栈参数的位置，并调用参数初始化函数runtime·args对参数进行初始化
@@ -206,23 +210,30 @@ ok:
 	MOVL	AX, 0(SP)
 	MOVQ	24(SP), AX		// copy argv
 	MOVQ	AX, 8(SP)
+	// 系统参数传递，主要是将系统参数转换传递给程序使用。
 	CALL	runtime·args(SB)
 	// 函数runtime·osinit主要做了两个事情，一是确定CPU的核数，在接下来初始化调度器时，P的个数将和CPU核数保持一致(如未人为修改)；
 	// 二是获取操作系统默认的内存页大小，用于内存管理。
 	// 操作系统初始化
+	// 系统基本参数设置，主要是获取 CPU 核心数和内存物理页大小。
 	CALL	runtime·osinit(SB)
 	// schedinit是本阶段的核心函数，负责协程调度器的初始化工作
-	// 调度器初始化
+	// 进行各种运行时组件的初始化，包含调度器、内存分配器、堆、栈、GC 等一大堆初始化工作。
+	// 会进行 p 的初始化，并将 m0 和某一个 p 进行绑定。
 	CALL	runtime·schedinit(SB)
 
 // 调度器初始化完成后，程序紧接着使用runtime·newproc创建了main协程。协程的具体创建过程参见下文描述。
 
 	// create a new goroutine to start program
-	// 入口函数，runtime.mainPC就是runtime.main
+	// 入口函数，主要工作是运行 main goroutine，虽然在runtime·rt0_go 中指向的是$runtime·mainPC，但实质指向的是 runtime.main。
 	MOVQ	$runtime·mainPC(SB), AX		// entry
+	// newproc 的第二个参数入栈，也就是新的 goroutine 需要执行的函数
 	PUSHQ	AX
+	// newproc 的第一个参数入栈，该参数表示 runtime.main 函数需要的参数大小，
+    // 因为 runtime.main 没有参数，所以这里是 0
 	PUSHQ	$0			// arg size
-	// 创建新的Goroutine启动程序, 执行的方法就是runtime.main
+	// 创建一个新的 goroutine 启动程序，执行的方法就是runtime.main。且绑定 runtime.main 方法（也就是应用程序中的入口 main 方法）。
+	// 并将其放入 m0 绑定的p的本地队列中去，以便后续调度。
 	CALL	runtime·newproc(SB)
 	POPQ	AX
 	POPQ	AX
@@ -230,6 +241,8 @@ ok:
 // 接下来就是启动M，mstart是所有新M创建后的入口函数，这也就是说除了在系统启动阶段会运行之外，每个M被创建后都会先运行mstart。
 
 	// start this M
+	// 启动 m，调度器开始进行循环调度。
+	// 主线程进入调度循环，运行刚刚创建的 goroutine
 	CALL	runtime·mstart(SB)
 
 	CALL	runtime·abort(SB)	// mstart should never return
@@ -237,6 +250,7 @@ ok:
 
 	// Prevent dead-code elimination of debugCallV1, which is
 	// intended to be called by debuggers.
+	// 永远不会返回，万一返回了，crash 掉
 	MOVQ	$runtime·debugCallV1(SB), AX
 	RET
 
@@ -282,40 +296,55 @@ TEXT runtime·gosave(SB), NOSPLIT, $0-8
 // 组成了一次看似常规的函数调用：协程的入口函数fn被goexit调用，当fn执行完毕后，会返回goexit继续执行。
 TEXT runtime·gogo(SB), NOSPLIT, $16-8
     // 传入参数，gp.sched
+    // 0(FP) 表示第一个参数，即 buf = &gp.sched
 	MOVQ	buf+0(FP), BX		// gobuf
 	MOVQ	gobuf_g(BX), DX
 	MOVQ	0(DX), CX		// make sure g != nil
 	// 将TLS的内存地址赋值给CX
 	get_tls(CX)
-	// 将需要运行的gp写入TLS
+	// 将需要运行的 g 放入到 tls[0]
+    // 把要运行的 g 的指针放入线程本地存储，这样后面的代码就可以通过线程本地存储
+    // 获取到当前正在执行的 goroutine 的 g 结构体对象，从而找到与之关联的 m 和 p
+    // 运行这条指令之前，线程本地存储存放的是 g0 的地址
 	MOVQ	DX, g(CX)
 	// 将gp的各参数赋值到寄存器： SP，BP
+	// 把 CPU 的 SP 寄存器设置为 sched.sp，完成了栈的切换
 	MOVQ	gobuf_sp(BX), SP	// restore SP
+	// 恢复调度上下文到CPU相关寄存器
 	MOVQ	gobuf_ret(BX), AX
 	MOVQ	gobuf_ctxt(BX), DX
 	MOVQ	gobuf_bp(BX), BP
-	// 清空gp.sched
+	// 清空 sched 的值，因为我们已把相关值放入 CPU 对应的寄存器了，不再需要，这样做可以减少 GC 的工作量
 	MOVQ	$0, gobuf_sp(BX)	// clear to help garbage collector
 	MOVQ	$0, gobuf_ret(BX)
 	MOVQ	$0, gobuf_ctxt(BX)
 	MOVQ	$0, gobuf_bp(BX)
 	// BX=PC,gp接下来运行的指令赋值给寄存器BX，也就是g的入口方法
+	// 把 sched.pc 值放入 BX 寄存器
 	MOVQ	gobuf_pc(BX), BX
 	// 直接跳转到PC的位置
+	// JMP 把 BX 寄存器的包含的地址值放入 CPU 的 IP 寄存器，于是，CPU 跳转到该地址继续执行指令
 	JMP	BX
 
 // func mcall(fn func(*g))
 // Switch to m->g0's stack, call fn(g).
 // Fn must never return. It should gogo(&g->sched)
 // to keep running g.
+// 切换到 g0 栈，执行 fn(g)
+// Fn 不能返回
 TEXT runtime·mcall(SB), NOSPLIT, $0-8
+    // 取出参数的值放入 DI 寄存器，它是 funcval 对象的指针，此场景中 fn.fn 是 goexit0 的地址
 	MOVQ	fn+0(FP), DI
 
 	get_tls(CX)
+	// AX = g
 	MOVQ	g(CX), AX	// save state in g->sched
+	// mcall 返回地址放入 BX
 	MOVQ	0(SP), BX	// caller's PC
+	// g.sched.pc = BX，保存 g 的 PC
 	MOVQ	BX, (g_sched+gobuf_pc)(AX)
 	LEAQ	fn+0(FP), BX	// caller's SP
+	// 保存 g 的 SP
 	MOVQ	BX, (g_sched+gobuf_sp)(AX)
 	MOVQ	AX, (g_sched+gobuf_g)(AX)
 	MOVQ	BP, (g_sched+gobuf_bp)(AX)
@@ -323,16 +352,23 @@ TEXT runtime·mcall(SB), NOSPLIT, $0-8
 	// switch to m->g0 & its stack, call fn
 	MOVQ	g(CX), BX
 	MOVQ	g_m(BX), BX
+	// SI = g0
 	MOVQ	m_g0(BX), SI
 	CMPQ	SI, AX	// if g == m->g0 call badmcall
 	JNE	3(PC)
 	MOVQ	$runtime·badmcall(SB), AX
 	JMP	AX
+	// 把 g0 的地址设置到线程本地存储中
 	MOVQ	SI, g(CX)	// g = m->g0
+	// 从 g 的栈切换到了 g0 的栈D
 	MOVQ	(g_sched+gobuf_sp)(SI), SP	// sp = m->g0->sched.sp
+	// AX = g，参数入栈
 	PUSHQ	AX
 	MOVQ	DI, DX
+	// DI 是结构体 funcval 实例对象的指针，它的第一个成员才是 goexit0 的地址
+    // 读取第一个成员到 DI 寄存器
 	MOVQ	0(DI), DI
+	// 调用 goexit0(g)
 	CALL	DI
 	POPQ	AX
 	MOVQ	$runtime·badmcall2(SB), AX
@@ -430,8 +466,11 @@ TEXT runtime·morestack(SB),NOSPLIT,$0-0
 	// Cannot grow scheduler stack (m->g0).
 	// m.g0栈上不允许发生扩栈
 	get_tls(CX)
+	// BX = g，g 表示 main goroutine
 	MOVQ	g(CX), BX
+	// BX = g.m
 	MOVQ	g_m(BX), BX
+	// SI = g.m.g0
 	MOVQ	m_g0(BX), SI
 	CMPQ	g(CX), SI
 	JNE	3(PC)
@@ -459,18 +498,28 @@ TEXT runtime·morestack(SB),NOSPLIT,$0-0
 
 	// Set g->sched to context in f.
 	// 更新扩栈发生时g.sched值为扩栈发生的函数相关值
+	// 将函数的返回地址保存到 AX 寄存器
 	MOVQ	0(SP), AX // f's PC
+	// 将函数的返回地址保存到 g.sched.pc
 	MOVQ	AX, (g_sched+gobuf_pc)(SI)
+	// g.sched.g = g
 	MOVQ	SI, (g_sched+gobuf_g)(SI)
+	// 取地址操作符，调用 morestack_noctxt 之前的 rsp
 	LEAQ	8(SP), AX // f's SP
+	// 将 main 函数的栈顶地址保存到 g.sched.sp
 	MOVQ	AX, (g_sched+gobuf_sp)(SI)
+	// 将 BP 寄存器保存到 g.sched.bp
 	MOVQ	BP, (g_sched+gobuf_bp)(SI)
 	MOVQ	DX, (g_sched+gobuf_ctxt)(SI)
 
 	// Call newstack on m->g0's stack.
 	// m.g0栈上调用函数newstack
+	// BX = g.m.g0
 	MOVQ	m_g0(BX), BX
+	// 将 g0 保存到本地存储 tls
 	MOVQ	BX, g(CX)
+	// 把 g0 栈的栈顶寄存器的值恢复到 CPU 的寄存器 SP，达到切换栈的目的，下面这一条指令执行之前，
+    // CPU 还是使用的调用此函数的 g 的栈，执行之后 CPU 就开始使用 g0 的栈了
 	MOVQ	(g_sched+gobuf_sp)(BX), SP
 	CALL	runtime·newstack(SB)
 	CALL	runtime·abort(SB)	// crash if newstack returns

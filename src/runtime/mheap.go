@@ -1396,9 +1396,12 @@ func (h *mheap) scavengeLargest(nbytes uintptr) {
 	}
 }
 
-// scavengeAll visits each node in the unscav treap and scavenges the
-// treapNode's span. It then removes the scavenged span from
-// unscav and adds it into scav before continuing. h must be locked.
+// scavengeAll visits each node in the unscav treap and scavenges the treapNode's span.
+// It then removes the scavenged span from unscav and adds it into scav before continuing.
+// h must be locked.
+// scavengeAll访问unscav treap中的每个节点并清扫treapNode的跨度。
+// 然后它从unscav中移除被清除的跨度，并在继续之前将其加入scav中。
+// h必须被锁定。
 func (h *mheap) scavengeAll(now, limit uint64) uintptr {
 	// Iterate over the treap scavenging spans if unused for at least limit time.
 	released := uintptr(0)
@@ -1426,6 +1429,8 @@ func (h *mheap) scavenge(k int32, now, limit uint64) {
 	// Disallow malloc or panic while holding the heap lock. We do
 	// this here because this is an non-mallocgc entry-point to
 	// the mheap API.
+	// 不允许在持有堆锁的情况下进行malloc或panic。
+	// 我们在这里这样做是因为这是一个非mallocgc的入口点，可以进入的入口。
 	gp := getg()
 	gp.m.mallocing++
 	lock(&h.lock)

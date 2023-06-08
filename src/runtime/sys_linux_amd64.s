@@ -525,6 +525,7 @@ TEXT runtime·madvise(SB),NOSPLIT,$0
 // int64 futex(int32 *uaddr, int32 op, int32 val,
 //	struct timespec *timeout, int32 *uaddr2, int32 val2);
 TEXT runtime·futex(SB),NOSPLIT,$0
+    // 为系统调用准备参数
 	MOVQ	addr+0(FP), DI
 	MOVL	op+8(FP), SI
 	MOVL	val+12(FP), DX
@@ -532,12 +533,16 @@ TEXT runtime·futex(SB),NOSPLIT,$0
 	MOVQ	addr2+24(FP), R8
 	MOVL	val3+32(FP), R9
 	MOVL	$SYS_futex, AX
+	// 执行 futex 系统调用进入休眠，被唤醒后接着执行下一条 MOVL 指令
 	SYSCALL
+	// 保存系统调用的返回值
 	MOVL	AX, ret+40(FP)
 	RET
 
 // int32 clone(int32 flags, void *stk, M *mp, G *gp, void (*fn)(void));
+// 核心就是调用 clone 函数创建系统线程，新线程从 mstart 函数开始执行。clone 函数由汇编语言实现
 TEXT runtime·clone(SB),NOSPLIT,$0
+    // 准备系统调用的参数
 	MOVL	flags+0(FP), DI
 	MOVQ	stk+8(FP), SI
 	MOVQ	$0, DX
@@ -545,20 +550,24 @@ TEXT runtime·clone(SB),NOSPLIT,$0
 
 	// Copy mp, gp, fn off parent stack for use by child.
 	// Careful: Linux system call clobbers CX and R11.
+	// 将 mp，gp，fn 拷贝到寄存器，对子线程可见
 	MOVQ	mp+16(FP), R8
 	MOVQ	gp+24(FP), R9
 	MOVQ	fn+32(FP), R12
 
+    // 系统调用 clone
 	MOVL	$SYS_clone, AX
 	SYSCALL
 
 	// In parent, return.
 	CMPQ	AX, $0
 	JEQ	3(PC)
+	// 父线程，返回
 	MOVL	AX, ret+40(FP)
 	RET
 
 	// In child, on new stack.
+	// 在子线程中。设置 CPU 栈顶寄存器指向子线程的栈顶
 	MOVQ	SI, SP
 
 	// If g or m are nil, skip Go-related setup.
@@ -568,11 +577,15 @@ TEXT runtime·clone(SB),NOSPLIT,$0
 	JEQ	nog
 
 	// Initialize m->procid to Linux tid
+	// 通过 gettid 系统调用获取线程 ID（tid）
 	MOVL	$SYS_gettid, AX
 	SYSCALL
+	// 设置 m.procid = tid
 	MOVQ	AX, m_procid(R8)
 
 	// Set FS to point at m->tls.
+	// 新线程刚刚创建出来，还未设置线程本地存储，即 m 结构体对象还未与工作线程关联起来，
+    // 下面的指令负责设置新线程的 TLS，把 m 对象和工作线程关联起来
 	LEAQ	m_tls(R8), DI
 	CALL	runtime·settls(SB)
 
@@ -584,6 +597,7 @@ TEXT runtime·clone(SB),NOSPLIT,$0
 
 nog:
 	// Call fn
+	// 调用 mstart 函数。永不返回
 	CALL	R12
 
 	// It shouldn't return. If it does, exit that thread.

@@ -127,7 +127,13 @@ func noteclear(n *note) {
 	n.key = 0
 }
 
+// 设置 nextp 为找到的 p，调用 notewakeup 唤醒 m。
+// 之前我们讲 findrunnable 函数的时候，对于最后没有找到工作的 m，
+// 我们调用 notesleep(&_g_.m.park)，使得 m 进入睡眠状态。
+// 现在终于有工作了，需要老将出山，将其唤醒：
 func notewakeup(n *note) {
+	// 设置 n.key = 1, 被唤醒的线程通过查看该值是否等于 1
+	// 来确定是被其它线程唤醒还是意外从睡眠中苏醒
 	old := atomic.Xchg(key32(&n.key), 1)
 	if old != 0 {
 		print("notewakeup - double wakeup (", old, ")\n")
@@ -136,22 +142,30 @@ func notewakeup(n *note) {
 	futexwakeup(key32(&n.key), 1)
 }
 
+// 睡眠
 func notesleep(n *note) {
 	gp := getg()
 	if gp != gp.m.g0 {
 		throw("notesleep not on g0")
 	}
+	// -1 表示无限期休眠
 	ns := int64(-1)
 	if *cgo_yield != nil {
 		// Sleep for an arbitrary-but-moderate interval to poll libc interceptors.
 		ns = 10e6
 	}
+	// 这里之所以需要用一个循环，是因为 futexsleep 有可能意外从睡眠中返回，
+	// 所以 futexsleep 函数返回后还需要检查 note.key 是否还是 0，
+	// 如果是 0 则表示并不是其它工作线程唤醒了我们，
+	// 只是 futexsleep 意外返回了，需要再次调用 futexsleep 进入睡眠
 	for atomic.Load(key32(&n.key)) == 0 {
+		// 表示 m 被阻塞
 		gp.m.blocked = true
 		futexsleep(key32(&n.key), 0, ns)
 		if *cgo_yield != nil {
 			asmcgocall(*cgo_yield, nil)
 		}
+		// 被唤醒，更新标志
 		gp.m.blocked = false
 	}
 }
